@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>GitHub AI 코드 분석 챗봇</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body class="container py-5">
+    <h2 class="mb-4">GitHub AI 코드 분석 챗봇</h2>
+    <form id="analyze-form">
+        <div class="mb-3">
+            <label for="repo-url" class="form-label">GitHub 저장소 URL</label>
+            <input type="url" class="form-control" id="repo-url" name="repo_url" required>
+        </div>
+        <div class="mb-3">
+            <label for="token" class="form-label">Personal Access Token (선택)</label>
+            <input type="password" class="form-control" id="token" name="token">
+        </div>
+        <button type="submit" class="btn btn-primary">분석 시작</button>
+    </form>
+    <div id="status" class="mt-4"></div>
+    <script>
+        document.getElementById('analyze-form').onsubmit = async function(e) {
+            e.preventDefault();
+            document.getElementById('status').innerText = '분석 중...';
+            const res = await fetch('/analyze', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    repo_url: document.getElementById('repo-url').value,
+                    token: document.getElementById('token').value
+                })
+            });
+            const data = await res.json();
+            if (data.session_id) {
+                window.location.href = `/chat/${data.session_id}`;
+            } else {
+                document.getElementById('status').innerText = data.error || data.status || '분석 실패';
+            }
+        }
+    </script>
+</body>
+</html> 

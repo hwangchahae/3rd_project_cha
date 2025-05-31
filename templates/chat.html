@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>챗봇 - GitHub AI 코드 분석</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+</head>
+<body class="container py-5">
+    <h2 class="mb-4">챗봇 - GitHub AI 코드 분석</h2>
+    <div id="repo-summary" class="mb-3">저장소 분석이 완료되었습니다. 질문해주세요!</div>
+    <div id="chat-box" class="border rounded p-3 mb-3" style="height:300px; overflow-y:auto; background:#f8f9fa;"></div>
+    <form id="chat-form" class="d-flex">
+        <input type="text" class="form-control me-2" id="user-input" placeholder="질문 또는 코드 수정 요청 입력..." autocomplete="off" required>
+        <button type="submit" class="btn btn-primary">전송</button>
+    </form>
+    <div id="code-preview" class="mt-4"></div>
+    <script>
+        const chatBox = document.getElementById('chat-box');
+        const codePreview = document.getElementById('code-preview');
+        let lastFileName = '';
+        let lastModifiedCode = '';
+        function isModifyRequest(text) {
+            // 간단한 규칙: "고쳐줘", "수정", "추가", "변경" 등 포함 시 수정 요청으로 간주
+            return /고쳐줘|수정|추가|변경|리팩터|refactor|fix|add|modify/i.test(text);
+        }
+        document.getElementById('chat-form').onsubmit = async function(e) {
+            e.preventDefault();
+            const input = document.getElementById('user-input');
+            const userMsg = input.value;
+            chatBox.innerHTML += `<div><b>나:</b> ${userMsg}</div>`;
+            input.value = '';
+            let url = '/chat';
+            if (isModifyRequest(userMsg)) url = '/modify_request';
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    session_id: '{{ session_id }}',
+                    message: userMsg
+                })
+            });
+            const data = await res.json();
+            if (data.answer) {
+                chatBox.innerHTML += `<div><b>AI:</b> ${data.answer}</div>`;
+            }
+            if (data.modified_code) {
+                lastFileName = data.file_name || '';
+                lastModifiedCode = data.modified_code || '';
+                codePreview.innerHTML = `<h5>수정된 코드 미리보기</h5><div><b>파일명:</b> ${lastFileName}</div><pre>${lastModifiedCode}</pre><button id='apply-btn' class='btn btn-success'>적용</button>`;
+                document.getElementById('apply-btn').onclick = async function() {
+                    const applyRes = await fetch('/apply_changes', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            session_id: '{{ session_id }}',
+                            file_name: lastFileName,
+                            new_content: lastModifiedCode
+                        })
+                    });
+                    const applyData = await applyRes.json();
+                    codePreview.innerHTML += `<div class='mt-2 text-success'>${applyData.result}</div>`;
+                }
+            } else {
+                codePreview.innerHTML = '';
+            }
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+    </script>
+</body>
+</html> 
