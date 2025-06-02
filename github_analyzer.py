@@ -22,6 +22,12 @@ import base64
 from typing import Optional, List, Dict, Any, Tuple
 from langchain.schema import Document
 from cryptography.fernet import Fernet
+import tiktoken
+import ast
+import markdown
+import concurrent.futures
+import asyncio
+import sys
 
 # ----------------- 상수 정의 -----------------
 MAIN_EXTENSIONS = ['.py', '.js', '.md']  # 분석할 주요 파일 확장자
@@ -32,7 +38,7 @@ KEY_FILE = ".key"  # 암호화 키 파일
 # ChromaDB 기본 클라이언트 (로컬)
 chroma_client = chromadb.Client()
 
-def analyze_repository(repo_url: str, token: Optional[str] = None, session_id: Optional[str] = None) -> List[Dict[str, str]]:
+def analyze_repository(repo_url: str, token: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
     GitHub 저장소를 분석하고 임베딩하는 메인 함수
     
@@ -40,6 +46,7 @@ def analyze_repository(repo_url: str, token: Optional[str] = None, session_id: O
     1. GitHub 저장소를 로컬에 클론
     2. 주요 파일 목록을 가져와서 필터링 (MAIN_EXTENSIONS에 정의된 확장자만)
     3. 파일 내용을 가져와서 임베딩 처리
+    4. 디렉토리 구조 트리 텍스트 생성
     
     Args:
         repo_url (str): 분석할 GitHub 저장소 URL
@@ -47,10 +54,10 @@ def analyze_repository(repo_url: str, token: Optional[str] = None, session_id: O
         session_id (Optional[str]): 세션 ID (기본값: owner_repo)
         
     Returns:
-        List[Dict[str, str]]: 
-            분석된 파일 목록
-            각 파일은 {'path': '...', 'content': '...'} 형식
-            
+        Dict[str, Any]:
+            'files': 분석된 파일 목록 (각 파일은 {'path': '...', 'content': '...'} 형식)
+            'directory_structure': 디렉토리 구조 트리 텍스트
+        
     Raises:
         ValueError: 잘못된 GitHub URL인 경우
         Exception: 저장소 클론 실패 시
@@ -67,8 +74,14 @@ def analyze_repository(repo_url: str, token: Optional[str] = None, session_id: O
         # 3. 데이터 임베딩 처리
         embedder = RepositoryEmbedder(fetcher.session_id)
         embedder.process_and_embed(files)
+
+        # 4. 디렉토리 구조 트리 텍스트 생성
+        directory_structure = fetcher.generate_directory_structure()
         
-        return files
+        return {
+            'files': files,
+            'directory_structure': directory_structure
+        }
         
     except ValueError as e:
         print(f"[오류] 잘못된 GitHub URL: {e}")
@@ -248,14 +261,14 @@ class GitHubRepositoryFetcher:
             return self.create_error_response(f'API 요청 실패: {str(e)}', 500)
         except Exception as e:
             return self.create_error_response(f'예상치 못한 오류: {str(e)}', 500)
-
+            
     def get_repo_content_as_document(self, path: str) -> Optional[Document]:
         """
         GitHub API를 사용하여 저장소의 파일 내용을 LangChain Document로 가져옴
         
         Args:
             path (str): 파일 경로
-            
+        
         Returns:
             Optional[Document]: 
                 LangChain Document 객체 또는 None (파일이 없는 경우)
@@ -342,36 +355,71 @@ class GitHubRepositoryFetcher:
         """
         return self.get_repo_directory_as_documents()
 
-    def filter_main_files(self):
-        """
-        주요 파일만 선별
-        
-        MAIN_EXTENSIONS에 정의된 확장자를 가진 파일만 self.files에 저장
-        """
-        dir_contents = self.get_repo_directory_contents()
+    def get_all_main_files(self, path=""):
+        files = []
+        dir_contents = self.get_repo_directory_contents(path)
         if isinstance(dir_contents, list):
-            self.files = [item['path'] for item in dir_contents 
-                         if item['type'] == 'file' and 
-                         any(item['path'].endswith(ext) for ext in MAIN_EXTENSIONS)]
+            for item in dir_contents:
+                if item['type'] == 'file' and any(item['path'].endswith(ext) for ext in MAIN_EXTENSIONS):
+                    files.append(item['path'])
+                elif item['type'] == 'dir':
+                    files.extend(self.get_all_main_files(item['path']))
+        return files
 
-    def get_file_contents(self) -> List[Dict[str, str]]:
+    def filter_main_files(self):
+        self.files = self.get_all_main_files()
+        print(f"[DEBUG] 필터링된 주요 파일: {self.files}")
+        print(f"[DEBUG] 주요 파일 개수: {len(self.files)}")
+
+    def get_file_contents(self) -> List[Dict[str, Any]]:
         """
         주요 파일의 내용을 읽어 딕셔너리 리스트로 반환
-        
         Returns:
-            List[Dict[str, str]]: 
+            List[Dict[str, Any]]: 
                 파일 경로와 내용을 포함하는 딕셔너리 리스트
-                [{'path': '...', 'content': '...'}, ...]
+                [{'path': '...', 'content': '...', 'file_name': ..., 'file_type': ..., 'sha': ..., 'source_url': ...}, ...]
         """
         file_objs = []
         for path in self.files:
             doc = self.get_repo_content_as_document(path)
             if doc:
+                meta = doc.metadata
                 file_objs.append({
                     'path': path,
-                    'content': doc.page_content
+                    'content': doc.page_content,
+                    'file_name': meta.get('file_name'),
+                    'file_type': meta.get('file_name', '').split('.')[-1] if meta.get('file_name') else '',
+                    'sha': meta.get('sha'),
+                    'source_url': meta.get('source'),
                 })
         return file_objs
+
+    def generate_directory_structure(self) -> str:
+        """
+        저장소의 전체 디렉토리/파일 구조를 트리 형태의 텍스트로 반환
+        """
+        # 디렉토리 내용 재귀적으로 가져오기
+        def build_tree(path=""):
+            items = self.get_repo_directory_contents(path)
+            tree = {}
+            if not items or isinstance(items, dict) and items.get('error'):
+                return tree
+            for item in items:
+                if item['type'] == 'file':
+                    tree[f"📄 {item['name']}"] = None
+                elif item['type'] == 'dir':
+                    tree[f"📁 {item['name']}"] = build_tree(item['path'])
+            return tree
+        
+        tree = build_tree()
+        lines = []
+        def traverse(node, prefix=""):
+            for key, value in sorted(node.items()):
+                lines.append(f"{prefix}{key}")
+                if value is not None:
+                    traverse(value, prefix + "  ")
+        traverse(tree)
+        return "\n".join(lines)
 
     # ----------------- 토큰 관련 기능 -----------------
     @staticmethod
@@ -480,45 +528,155 @@ class RepositoryEmbedder:
         self.session_id = session_id
         self.collection = chroma_client.get_or_create_collection(name=f"repo_{session_id}")
 
-    def process_and_embed(self, files: List[Dict[str, str]]):
-        """
-        파일 내용을 처리하고 임베딩
-        
-        Args:
-            files (List[Dict[str, str]]): 
-                처리할 파일 목록
-                각 파일은 {'path': '...', 'content': '...'} 형식
-        """
-        chunk_id = 0
-        api_key = os.environ.get("OPENAI_API_KEY")
-        print(f"[DEBUG] 임베딩 직전 OPENAI_API_KEY: {api_key[:8]}...{api_key[-4:]}")
-        client = openai.OpenAI(api_key=api_key)
-        
-        for file in files:
-            content = file['content']
-            path = file['path']
-            
-            # 500자 단위로 청크 분할
-            for i in range(0, len(content), CHUNK_SIZE):
-                chunk = content[i:i+CHUNK_SIZE]
-                
-                # OpenAI 임베딩 생성
+    def process_and_embed(self, files: List[Dict[str, Any]]):
+        # 내부 비동기 함수 정의
+        async def async_process_and_embed(files):
+            import openai
+            api_key = os.environ.get("OPENAI_API_KEY")
+            client = openai.AsyncClient(api_key=api_key)
+            enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+            def safe_meta(meta):
+                return {k: ('' if v is None else v if not isinstance(v, (int, float, bool)) else v) for k, v in meta.items()}
+            def split_by_tokens(text, max_tokens=256, overlap=64):
+                tokens = enc.encode(text)
+                chunks = []
+                start = 0
+                while start < len(tokens):
+                    end = min(start + max_tokens, len(tokens))
+                    chunk = enc.decode(tokens[start:end])
+                    chunks.append((chunk, start, end))
+                    if end == len(tokens):
+                        break
+                    start += max_tokens - overlap
+                return chunks
+            def chunk_python_functions(source_code):
                 try:
-                    response = client.embeddings.create(
+                    tree = ast.parse(source_code)
+                except Exception:
+                    return [(source_code, 0, len(enc.encode(source_code)), None, None, 1, len(source_code.splitlines()))]
+                lines = source_code.splitlines()
+                chunks = []
+                for node in tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                        start = node.lineno - 1
+                        end = getattr(node, 'end_lineno', None)
+                        if end is None:
+                            continue
+                        chunk = '\n'.join(lines[start:end])
+                        name = node.name
+                        class_name = node.name if isinstance(node, ast.ClassDef) else None
+                        func_name = node.name if isinstance(node, ast.FunctionDef) else None
+                        if len(enc.encode(chunk)) > 256:
+                            for sub_chunk, t_start, t_end in split_by_tokens(chunk, max_tokens=256, overlap=64):
+                                chunks.append((sub_chunk, t_start, t_end, func_name, class_name, start+1, end))
+                        else:
+                            chunks.append((chunk, 0, len(enc.encode(chunk)), func_name, class_name, start+1, end))
+                if not chunks:
+                    for chunk, t_start, t_end in split_by_tokens(source_code, max_tokens=256, overlap=64):
+                        chunks.append((chunk, t_start, t_end, None, None, 1, len(source_code.splitlines())))
+                return chunks
+            def chunk_markdown(md_text):
+                pattern = r'(\n#+ .+|\n```[\s\S]+?```|\n\s*\n)'
+                parts = re.split(pattern, md_text)
+                chunks = []
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if len(enc.encode(part)) > 256:
+                        for chunk, t_start, t_end in split_by_tokens(part, max_tokens=256, overlap=64):
+                            chunks.append((chunk, t_start, t_end, None, None, None, None))
+                    else:
+                        chunks.append((part, 0, len(enc.encode(part)), None, None, None, None))
+                return chunks
+            def chunk_js(source_code):
+                return [(*x, None, None, None, None) for x in split_by_tokens(source_code, max_tokens=256, overlap=64)]
+            # 1. 전체 청크 수집
+            all_chunks = []
+            for file in files:
+                content = file['content']
+                path = file['path']
+                ext = os.path.splitext(path)[1].lower()
+                file_name = file.get('file_name')
+                file_type = file.get('file_type')
+                sha = file.get('sha')
+                source_url = file.get('source_url')
+                if ext == '.py':
+                    chunks = chunk_python_functions(content)
+                elif ext == '.md':
+                    chunks = chunk_markdown(content)
+                elif ext == '.js':
+                    chunks = chunk_js(content)
+                else:
+                    chunks = [(*x, None, None, None, None) for x in split_by_tokens(content, max_tokens=256, overlap=64)]
+                for i, (chunk, t_start, t_end, func_name, class_name, start_line, end_line) in enumerate(chunks):
+                    all_chunks.append((chunk, file, i, t_start, t_end, func_name, class_name, start_line, end_line))
+            # 2. 비동기 임베딩+역할태깅 함수
+            async def embed_and_tag_async(args, client):
+                chunk, file, i, t_start, t_end, func_name, class_name, start_line, end_line = args
+                # 임베딩
+                try:
+                    emb_resp = await client.embeddings.create(
                         input=chunk,
                         model="text-embedding-3-small"
                     )
-                    embedding = response.data[0].embedding
+                    embedding = emb_resp.data[0].embedding
                 except Exception as e:
-                    print("[DEBUG] OpenAI 임베딩 에러:", e)
-                    raise
-                    
-                # ChromaDB에 저장
+                    print(f"[WARNING] 임베딩 실패: {e}")
+                    embedding = [0.0] * 1536
+                # 역할 태깅
+                tag_prompt = f"아래 코드는 어떤 역할(기능/목적)을 하나요? 한글로 간단히 요약해줘.\n\n코드:\n{chunk}"
+                try:
+                    tag_resp = await client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": tag_prompt}],
+                        temperature=0.0,
+                        max_tokens=32
+                    )
+                    role_tag = tag_resp.choices[0].message.content.strip()
+                except Exception as e:
+                    print(f"[WARNING] 역할 태깅 실패: {e}")
+                    role_tag = ''
+                return (embedding, role_tag, chunk, file, i, t_start, t_end, func_name, class_name, start_line, end_line)
+            # 3. 비동기 병렬 실행 (max_concurrent=20)
+            print(f"[DEBUG] 임베딩+역할태깅 asyncio 병렬 처리 시작 (청크 수: {len(all_chunks)})")
+            semaphore = asyncio.Semaphore(20)
+            async def sem_task(args):
+                async with semaphore:
+                    return await embed_and_tag_async(args, client)
+            tasks = [sem_task(args) for args in all_chunks]
+            results = await asyncio.gather(*tasks)
+            print(f"[DEBUG] 임베딩+역할태깅 asyncio 병렬 처리 완료")
+            # 4. DB 저장 (동기)
+            for embedding, role_tag, chunk, file, i, t_start, t_end, func_name, class_name, start_line, end_line in results:
+                file_name = file.get('file_name')
+                file_type = file.get('file_type')
+                sha = file.get('sha')
+                source_url = file.get('source_url')
+                path = file['path']
+                metadata = {
+                    "path": path or '',
+                    "file_name": file_name or '',
+                    "file_type": file_type or '',
+                    "sha": sha or '',
+                    "source_url": source_url or '',
+                    "chunk_index": i,
+                    "function_name": func_name or '',
+                    "class_name": class_name or '',
+                    "start_line": start_line if start_line is not None else -1,
+                    "end_line": end_line if end_line is not None else -1,
+                    "token_start": t_start if t_start is not None else -1,
+                    "token_end": t_end if t_end is not None else -1,
+                    "role_tag": role_tag
+                }
                 self.collection.add(
-                    ids=[f"{path}_{i//CHUNK_SIZE}"],
+                    ids=[f"{path}_{i}"],
                     embeddings=[embedding],
                     documents=[chunk],
-                    metadatas=[{"path": path, "chunk_index": i // CHUNK_SIZE}]
+                    metadatas=[safe_meta(metadata)]
                 )
-                chunk_id += 1
-
+        # 동기 함수에서 비동기 실행
+        if sys.version_info >= (3, 7):
+            asyncio.run(async_process_and_embed(files))
+        else:
+            raise RuntimeError("Python 3.7 이상에서만 지원됩니다.")
